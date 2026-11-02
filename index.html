@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Panel Sensorial · Sesiones</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    input[type="range"]::-webkit-slider-thumb{ -webkit-appearance:none; width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#dc2626,#991b1b);cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.5);border:3px solid #fff}
+    input[type="range"]::-moz-range-thumb{ width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#dc2626,#991b1b);cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.5);border:3px solid #fff}
+    @media print {
+      body { background: #fff !important; }
+      .no-print { display: none !important; }
+      .print-area { box-shadow: none !important; margin: 0 !important; max-width: none !important; }
+      .page-break { page-break-after: always; }
+    }
+  </style>
+</head>
+<body class="bg-slate-900">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+// =====================================================================
+// CONEXIÓN CON GOOGLE SHEETS
+// La URL real se lee de config.json sin caché (así un cambio llega a todos).
+// =====================================================================
+const URL_RESPALDO = '';
+let URL_API = null;
+async function urlApi() {
+  if (URL_API) return URL_API;
+  try {
+    const c = await (await fetch('config.json?v=' + Date.now(), { cache: 'no-store' })).json();
+    if (c && c.scriptUrl) URL_API = c.scriptUrl;
+  } catch {}
+  return URL_API || URL_RESPALDO;
+}
+// text/plain evita el "preflight" CORS que Apps Script no soporta
+async function api(accion, datos = {}) {
+  const res = await fetch(await urlApi(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ accion, ...datos }),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  if (!data.ok) { const e = new Error(data.error || 'Error del servidor'); e.data = data; throw e; }
+  return data;
+}
+
+// ---- almacenamiento local seguro
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ---- cola de respuestas (si no hay internet, se guardan y se reintentan)
+const QUEUE_KEY = 'ps_sesiones_pendientes';
+const leerCola = () => LS.get(QUEUE_KEY, []);
+function encolar(fila) {
+  const q = leerCola().filter(p => p.id !== fila.id);
+  q.push(fila);
+  LS.set(QUEUE_KEY, q);
+}
+let enviandoCola = null;
+async function vaciarCola() {
+  if (enviandoCola) return enviandoCola;
+  enviandoCola = (async () => {
+    const q = leerCola();
+    if (!q.length) return 0;
+    try {
+      await api('guardar', { filas: q });
+      const enviados = new Set(q.map(p => p.id + '@' + p.timestamp));
+      const resto = leerCola().filter(p => !enviados.has(p.id + '@' + p.timestamp));
+      LS.set(QUEUE_KEY, resto);
+      return resto.length;
+    } catch {
+      return leerCola().length;
+    }
+  })();
+  try { return await enviandoCola; } finally { enviandoCola = null; }
+}
+
+// =====================================================================
+// GENERADOR DE DISEÑO (equivalente a crear_grupos_aleatorios_df + generar_archivos_csv)
+// =====================================================================
+function rng(seed) { // mulberry32: aleatorio reproducible con semilla
+  let a = (seed >>> 0) || 1;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function barajar(arr, r) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+// Cuadrado de Williams (igual que crossdes::williams): n filas si n es par, 2n si es impar
+function williams(n) {
+  if (n === 1) return [[0]];
+  const primera = [0];
+  let lo = 1, hi = n - 1, t = true;
+  while (primera.length < n) { primera.push(t ? lo++ : hi--); t = !t; }
+  const filas = [];
+  for (let i = 0; i < n; i++) filas.push(primera.map(x => (x + i) % n));
+  return n % 2 ? filas.concat(filas.map(f => [...f].reverse())) : filas;
+}
+
+function generarDiseno({ vinos, porSesion, reps, nPanelistas, parejo, semilla }) {
+  const r = rng(semilla);
+  const mezclados = barajar(vinos, r);
+  const nGrupos = Math.ceil(mezclados.length / porSesion);
+  // tamaños de grupo
+  let tam = [];
+  if (parejo) {
+    const base = Math.floor(mezclados.length / nGrupos), extra = mezclados.length % nGrupos;
+    tam = Array.from({ length: nGrupos }, (_, i) => base + (i < extra ? 1 : 0));
+  } else {
+    tam = Array.from({ length: nGrupos }, (_, i) => Math.min(porSesion, mezclados.length - i * porSesion));
+  }
+  const grupos = []; let p = 0;
+  tam.forEach(t => { grupos.push(mezclados.slice(p, p + t)); p += t; });
+
+  // códigos de 3 dígitos únicos en todo el estudio
+  const codigos = barajar(Array.from({ length: 900 }, (_, i) => String(100 + i)), r);
+  let ic = 0;
+
+  const panelistas = Array.from({ length: nPanelistas }, (_, i) => 'V' + (i + 1));
+  const sesiones = [], diseno = [];
+  let ns = 0;
+  for (let rep = 1; rep <= reps; rep++) {
+    grupos.forEach((g, gi) => {
+      ns++;
+      const sesion = 'S' + ns;
+      const grupo = 'f' + (gi + 1);
+      const cod = {}; g.forEach(v => { cod[v] = codigos[ic++]; });
+      const W = williams(g.length);
+      const mapeos = {}; // un orden aleatorio de vinos por cada bloque de panelistas
+      panelistas.forEach((v, pi) => {
+        const bloque = Math.floor(pi / W.length), fila = pi % W.length;
+        if (!mapeos[bloque]) mapeos[bloque] = barajar(g, r);
+        W[fila].forEach((pos, k) => {
+          const vino = mapeos[bloque][pos];
+          diseno.push({
+            Sesion: sesion, Grupo: grupo, Rep: rep, Valuador: v, Orden: k + 1,
+            Muestra: String(g.indexOf(vino) + 1), NombreProducto: vino, CodigoProducto: cod[vino],
+          });
+        });
+      });
+      sesiones.push({ Sesion: sesion, Grupo: grupo, Rep: rep, NMuestras: g.length, Vinos: g.join(' | '), codigos: cod, filasWilliams: W.length });
+    });
+  }
+  return { sesiones, diseno, grupos };
+}
+
+const ordenNatural = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+const ahora = () => {
+  const d = new Date(), z = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}`;
+};
+
+// =====================================================================
+// UI común
+// =====================================================================
+const Icon = ({ path, className = 'w-full h-full' }) => (
+  <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={path} />
+  </svg>
+);
+const Wine = () => <Icon path="M8 2h8l-1 7a3 3 0 01-6 0L8 2zm4 10v8m-4 0h8" />;
+const Check = () => <Icon path="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />;
+const Lock = () => <Icon path="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />;
+
+const Tarjeta = ({ children, ancho = 'max-w-md' }) => (
+  <div className="min-h-screen flex items-center justify-center p-4">
+    <div className={`bg-white rounded-2xl shadow-2xl p-6 sm:p-8 ${ancho} w-full`}>{children}</div>
+  </div>
+);
+
+function useCola() {
+  const [pendientes, setPendientes] = useState(leerCola().length);
+  const [enviando, setEnviando] = useState(false);
+  const intentar = async () => {
+    if (!leerCola().length) { setPendientes(0); return; }
+    setEnviando(true);
+    setPendientes(await vaciarCola());
+    setEnviando(false);
+  };
+  useEffect(() => {
+    intentar();
+    window.addEventListener('online', intentar);
+    const t = setInterval(intentar, 20000);
+    return () => { window.removeEventListener('online', intentar); clearInterval(t); };
+  }, []);
+  return { pendientes, enviando, intentar, refrescar: () => setPendientes(leerCola().length) };
+}
+
+const EstadoNube = ({ pendientes, enviando, oscuro }) => (
+  pendientes === 0
+    ? <p className={`text-sm font-semibold ${oscuro ? 'text-emerald-300' : 'text-emerald-600'}`}>☁️ {enviando ? 'Guardando…' : 'Todo guardado en la nube'}</p>
+    : <p className={`text-sm font-semibold ${oscuro ? 'text-amber-300' : 'text-amber-600'}`}>⏳ {pendientes} respuesta(s) pendiente(s) {enviando ? '(enviando…)' : '(se reintenta sola)'}</p>
+);
+
+// =====================================================================
+// APP DEL PANELISTA
+// =====================================================================
+function PanelApp() {
+  const [config, setConfig] = useState(LS.get('ps_config', null));
+  const [error, setError] = useState(null);
+  const [cargando, setCargando] = useState(true);
+  const [vista, setVista] = useState('inicio');
+  const [valuador, setValuador] = useState('');
+  const [datosPan, setDatosPan] = useState(null); // {diseno, progreso}
+  const [sesion, setSesion] = useState(null);
+  const [filas, setFilas] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [valores, setValores] = useState({});
+  const [buffer, setBuffer] = useState({});
+  const [hechasLocal, setHechasLocal] = useState({}); // {S1: Set de órdenes}
+  const cola = useCola();
+
+  const atributos = config?.atributos || [];
+
+  const cargarConfig = async () => {
+    setCargando(true); setError(null);
+    try {
+      const c = await api('config');
+      setConfig(c); LS.set('ps_config', c);
+    } catch (e) {
+      if (!config) setError('No se pudo conectar. Revisá la conexión a internet y reintentá.');
+    } finally { setCargando(false); }
+  };
+  useEffect(() => { cargarConfig(); }, []);
+
+  const elegirPanelista = async (v) => {
+    setValuador(v); setVista('sesiones'); setDatosPan(LS.get('ps_pan_' + v, null)); setHechasLocal({});
+    try {
+      const d = await api('panelista', { valuador: v });
+      setDatosPan(d); LS.set('ps_pan_' + v, d);
+    } catch {
+      if (!LS.get('ps_pan_' + v, null)) setError('No se pudieron cargar tus sesiones. Reintentá con conexión.');
+    }
+  };
+
+  // órdenes respondidas = servidor + cola pendiente + lo hecho en este dispositivo
+  const respondidas = (s) => {
+    const set = new Set((datosPan?.progreso?.[s] || []).map(Number));
+    leerCola().forEach(p => { if (p.Valuador === valuador && p.Sesion === s) set.add(Number(p.Orden)); });
+    (hechasLocal[s] || []).forEach(o => set.add(o));
+    return set;
+  };
+
+  const misSesiones = useMemo(() => {
+    if (!datosPan) return [];
+    const por = {};
+    datosPan.diseno.forEach(r => { (por[r.Sesion] = por[r.Sesion] || []).push(r); });
+    return Object.keys(por).sort(ordenNatural).map(s => ({
+      Sesion: s, Grupo: por[s][0].Grupo, Rep: por[s][0].Rep,
+      filas: por[s].sort((a, b) => a.Orden - b.Orden),
+    }));
+  }, [datosPan]);
+
+  const ceros = () => { const o = {}; atributos.forEach(a => o[a] = 0); return o; };
+
+  const abrirSesion = (s) => {
+    const hechas = respondidas(s.Sesion);
+    const primera = s.filas.findIndex(f => !hechas.has(f.Orden));
+    setSesion(s); setFilas(s.filas); setBuffer({});
+    setIdx(primera === -1 ? 0 : primera);
+    setValores(ceros());
+    setVista('evaluacion'); window.scrollTo(0, 0);
+  };
+
+  const enviarMuestra = () => {
+    const f = filas[idx];
+    const fila = {
+      id: `${valuador}|${sesion.Sesion}|${f.Orden}`,
+      Sesion: sesion.Sesion, Grupo: sesion.Grupo, Rep: sesion.Rep, Valuador: valuador, Orden: f.Orden,
+      Muestra: f.Muestra, NombreProducto: f.NombreProducto, CodigoProducto: f.CodigoProducto,
+      timestamp: ahora(), ...valores,
+    };
+    encolar(fila); cola.refrescar(); cola.intentar();
+    const nb = { ...buffer, [f.Orden]: { ...valores } };
+    setBuffer(nb);
+    const hechas = new Set([...(hechasLocal[sesion.Sesion] || []), f.Orden]);
+    setHechasLocal(prev => ({ ...prev, [sesion.Sesion]: [...hechas] }));
+    const todas = respondidas(sesion.Sesion); hechas.forEach(o => todas.add(o));
+    // siguiente sin responder (primero hacia adelante, luego desde el principio)
+    let sig = filas.findIndex((x, i) => i > idx && !todas.has(x.Orden));
+    if (sig === -1) sig = filas.findIndex(x => !todas.has(x.Orden));
+    if (sig === -1) { setVista('finSesion'); window.scrollTo(0, 0); return; }
+    setIdx(sig); setValores(nb[filas[sig].Orden] || ceros()); window.scrollTo(0, 0);
+  };
+
+  const volver = () => {
+    if (idx === 0) return;
+    setBuffer(b => ({ ...b, [filas[idx].Orden]: { ...valores } }));
+    const p = idx - 1;
+    setIdx(p); setValores(buffer[filas[p].Orden] || ceros()); window.scrollTo(0, 0);
+  };
+
+  // ------------------------------------------------------------- vistas
+  if (cargando && !config) {
+    return <Tarjeta><div className="text-center">
+      <div className="w-14 h-14 mx-auto text-purple-600 mb-4 animate-pulse"><Wine/></div>
+      <h2 className="text-xl font-bold text-gray-800">Cargando…</h2>
+    </div></Tarjeta>;
+  }
+  if (error && !config) {
+    return <Tarjeta><div className="text-center">
+      <p className="text-red-600 mb-4">{error}</p>
+      <button onClick={cargarConfig} className="bg-purple-600 text-white font-semibold py-3 px-6 rounded-lg">Reintentar</button>
+    </div></Tarjeta>;
+  }
+
+  if (vista === 'inicio') {
+    const sinDiseno = !config.panelistas || !config.panelistas.length;
+    return (
+      <Tarjeta>
+        <div className="text-center mb-6">
+          <div className="w-14 h-14 mx-auto text-purple-600 mb-3"><Wine/></div>
+          <h1 className="text-3xl font-bold text-gray-800 mb-1">{config.estudio || 'Análisis Sensorial'}</h1>
+          <p className="text-gray-600">Seleccioná tu número de panelista</p>
+          <p className="text-xs text-gray-400 mt-1">{(config.sesiones || []).length} sesiones • {atributos.length} atributos</p>
+        </div>
+        {sinDiseno
+          ? <p className="text-center text-gray-500">Todavía no hay un diseño cargado.</p>
+          : <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 max-h-96 overflow-y-auto">
+              {config.panelistas.map(v => (
+                <button key={v} onClick={() => elegirPanelista(v)}
+                  className="bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-bold py-3 rounded-lg">{v}</button>
+              ))}
+            </div>}
+        <div className="mt-6 text-center"><EstadoNube {...cola} /></div>
+      </Tarjeta>
+    );
+  }
+
+  if (vista === 'sesiones') {
+    return (
+      <Tarjeta ancho="max-w-xl">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">Panelista {valuador}</h1>
+            <p className="text-gray-600 text-sm">Elegí la sesión que vas a evaluar</p>
+          </div>
+          <button onClick={() => { setVista('inicio'); setValuador(''); }} className="text-sm text-purple-700 hover:underline">Cambiar</button>
+        </div>
+        {!datosPan
+          ? <p className="text-gray-500 text-center py-8 animate-pulse">Cargando tus sesiones…</p>
+          : <div className="space-y-3">
+              {misSesiones.map(s => {
+                const n = s.filas.length, h = respondidas(s.Sesion).size;
+                const completa = h >= n, enCurso = h > 0 && !completa;
+                return (
+                  <button key={s.Sesion} disabled={completa} onClick={() => abrirSesion(s)}
+                    className={`w-full text-left rounded-xl p-4 border-2 flex items-center justify-between transition-all ${
+                      completa ? 'bg-gray-100 border-gray-200 text-gray-400 cursor-not-allowed'
+                      : enCurso ? 'bg-amber-50 border-amber-300 hover:border-amber-500'
+                      : 'bg-white border-purple-200 hover:border-purple-500 hover:shadow'}`}>
+                    <div>
+                      <p className={`font-bold text-lg ${completa ? '' : 'text-gray-800'}`}>Sesión {s.Sesion.replace(/^S/, '')}</p>
+                      <p className="text-sm">{n} muestras · repetición {s.Rep}</p>
+                    </div>
+                    <div className="text-right">
+                      {completa ? <span className="flex items-center gap-1 font-semibold text-emerald-600"><span className="w-6 h-6 inline-block"><Check/></span> Completada</span>
+                        : enCurso ? <span className="font-semibold text-amber-600">En curso {h}/{n}</span>
+                        : <span className="font-semibold text-purple-600">Comenzar →</span>}
+                    </div>
+                  </button>
+                );
+              })}
+              {!misSesiones.length && <p className="text-gray-500 text-center">No tenés sesiones asignadas.</p>}
+            </div>}
+        <div className="mt-5 text-center"><EstadoNube {...cola} /></div>
+      </Tarjeta>
+    );
+  }
+
+  if (vista === 'finSesion') {
+    return (
+      <Tarjeta>
+        <div className="text-center">
+          <div className="w-20 h-20 mx-auto text-green-600 mb-4"><Check/></div>
+          <h1 className="text-2xl font-bold text-gray-800 mb-2">¡Sesión {sesion.Sesion.replace(/^S/, '')} completada!</h1>
+          <p className="text-gray-600 mb-4">Gracias, <strong>{valuador}</strong>.</p>
+          <div className="mb-6 p-3 rounded-lg bg-gray-50 border"><EstadoNube {...cola} /></div>
+          {cola.pendientes > 0 && (
+            <button onClick={cola.intentar} disabled={cola.enviando} className="w-full mb-3 bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 rounded-lg disabled:opacity-50">Reintentar envío ahora</button>
+          )}
+          <button onClick={() => { setVista('sesiones'); elegirPanelista(valuador); }}
+            className="w-full bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-bold py-3 rounded-lg mb-3">Ver mis sesiones</button>
+          <button onClick={() => { setVista('inicio'); setValuador(''); }}
+            className="w-full bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold py-3 rounded-lg">Salir</button>
+        </div>
+      </Tarjeta>
+    );
+  }
+
+  // evaluación
+  const f = filas[idx] || {};
+  const hechasSesion = respondidas(sesion.Sesion);
+  return (
+    <div className="min-h-screen py-6 px-4">
+      <div className="max-w-4xl mx-auto">
+        <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-5 mb-5 border border-white/20">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="text-xl font-bold text-white">Panelista {valuador} · Sesión {sesion.Sesion.replace(/^S/, '')}</h2>
+              <p className="text-purple-200">Muestra {idx + 1} de {filas.length}</p>
+              <div className="mt-1"><EstadoNube {...cola} oscuro /></div>
+            </div>
+            <button onClick={() => { setVista('sesiones'); }} className="text-sm text-purple-200 hover:text-white underline">Salir de la sesión</button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="bg-gradient-to-br from-yellow-400 to-orange-500 rounded-lg p-4 shadow-lg">
+              <p className="text-gray-800 font-semibold text-sm mb-1">Código de Muestra</p>
+              <p className="text-gray-900 text-4xl font-bold">{f.CodigoProducto}</p>
+            </div>
+            <div className="bg-white/20 rounded-lg p-4 border-2 border-white/40">
+              <p className="text-white font-semibold text-sm mb-2">Progreso de la sesión</p>
+              <div className="flex items-center gap-2">
+                <div className="flex-1 bg-white/30 rounded-full h-4">
+                  <div className="bg-gradient-to-r from-green-400 to-emerald-500 h-4 rounded-full transition-all" style={{ width: (hechasSesion.size / Math.max(1, filas.length)) * 100 + '%' }}/>
+                </div>
+                <span className="text-white font-bold">{hechasSesion.size}/{filas.length}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-5 mb-5 border border-white/20">
+          <h3 className="text-xl font-bold text-white mb-5">Evaluación de Atributos</h3>
+          <div className="space-y-5">
+            {atributos.map(attr => (
+              <div key={attr} className="bg-gradient-to-r from-slate-800/80 to-slate-700/80 rounded-lg p-5 border-2 border-slate-600/50 shadow-lg">
+                <div className="flex justify-between items-center mb-3">
+                  <label className="text-white font-semibold text-lg">{attr}</label>
+                  <span className="bg-gradient-to-r from-pink-500 to-rose-500 text-white px-5 py-2 rounded-full font-bold text-xl min-w-[70px] text-center shadow-lg">
+                    {(valores[attr] ?? 0).toFixed(1)}
+                  </span>
+                </div>
+                <input type="range" min="0" max="10" step="0.1" value={valores[attr] ?? 0}
+                  onChange={e => setValores(prev => ({ ...prev, [attr]: Number(e.target.value) }))}
+                  className="w-full h-4 rounded-lg appearance-none cursor-pointer"
+                  style={{ background: `linear-gradient(to right,#f59e0b 0%,#f59e0b ${(valores[attr] || 0) * 10}%,#cbd5e1 ${(valores[attr] || 0) * 10}%,#cbd5e1 100%)` }} />
+                <div className="flex justify-between text-gray-200 font-semibold text-sm mt-2"><span>0</span><span>5</span><span>10</span></div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <button onClick={enviarMuestra}
+            className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-bold py-4 rounded-xl shadow-2xl text-lg">
+            {hechasSesion.size + (hechasSesion.has(f.Orden) ? 0 : 1) >= filas.length ? 'Finalizar sesión ✓' : 'Enviar y continuar →'}
+          </button>
+          {idx > 0 && (
+            <button onClick={volver} className="w-full bg-white/10 hover:bg-white/20 border-2 border-white/30 text-white font-semibold py-3 rounded-xl">← Volver a la muestra anterior</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================
+// APP DEL ADMINISTRADOR  (index.html#admin)
+// =====================================================================
+function AdminApp() {
+  const [clave, setClave] = useState(() => { try { return sessionStorage.getItem('ps_admin') || ''; } catch { return ''; } });
+  const [logueado, setLogueado] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [ocupado, setOcupado] = useState(false);
+  const [tab, setTab] = useState('generar');
+  const [estado, setEstado] = useState(null);
+
+  const cargarEstado = async (c = clave) => {
+    const e = await api('adminEstado', { clave: c });
+    setEstado(e); return e;
+  };
+
+  const login = async (e) => {
+    e && e.preventDefault();
+    setOcupado(true); setMsg('');
+    try {
+      await api('adminLogin', { clave });
+      try { sessionStorage.setItem('ps_admin', clave); } catch {}
+      setLogueado(true);
+      await cargarEstado();
+    } catch (err) { setMsg(err.message); }
+    finally { setOcupado(false); }
+  };
+  useEffect(() => { if (clave) login(); }, []);
+
+  if (!logueado) {
+    return (
+      <Tarjeta>
+        <div className="text-center mb-6">
+          <div className="w-12 h-12 mx-auto text-purple-600 mb-3"><Lock/></div>
+          <h1 className="text-2xl font-bold text-gray-800">Administración</h1>
+          <p className="text-gray-600 text-sm">Ingresá la clave de administrador</p>
+        </div>
+        <form onSubmit={login} className="space-y-3">
+          <input type="password" value={clave} onChange={e => setClave(e.target.value)} placeholder="Clave"
+            className="w-full border-2 border-gray-200 rounded-lg px-4 py-3 text-lg focus:border-purple-500 outline-none" />
+          <button disabled={ocupado || !clave} className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 rounded-lg disabled:opacity-50">
+            {ocupado ? 'Verificando…' : 'Entrar'}
+          </button>
+        </form>
+        {msg && <p className="text-red-600 mt-3 text-center">{msg}</p>}
+        <p className="text-center mt-6"><a href="#" className="text-sm text-purple-700 hover:underline">← Ir a la app de panelistas</a></p>
+      </Tarjeta>
+    );
+  }
+
+  const tabs = [['generar', 'Armar sesiones'], ['progreso', 'Progreso'], ['servicio', 'Planilla de servicio']];
+  return (
+    <div className="min-h-screen py-6 px-4">
+      <div className="max-w-6xl mx-auto bg-white rounded-2xl shadow-2xl p-5 sm:p-7 print-area">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-5 no-print">
+          <h1 className="text-2xl font-bold text-gray-800">Administración · {estado?.estudio || 'Panel Sensorial'}</h1>
+          <div className="flex gap-2 items-center">
+            <a href="#" className="text-sm text-purple-700 hover:underline mr-2">App de panelistas</a>
+            <button onClick={() => { try { sessionStorage.removeItem('ps_admin'); } catch {} setLogueado(false); setClave(''); }}
+              className="text-sm text-gray-500 hover:underline">Salir</button>
+          </div>
+        </div>
+        <div className="flex gap-2 border-b mb-5 no-print">
+          {tabs.map(([k, t]) => (
+            <button key={k} onClick={() => { setTab(k); if (k !== 'generar') cargarEstado(); }}
+              className={`px-4 py-2 font-semibold rounded-t-lg ${tab === k ? 'bg-purple-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>{t}</button>
+          ))}
+        </div>
+        {tab === 'generar' && <Generar clave={clave} estado={estado} alGuardar={() => cargarEstado()} />}
+        {tab === 'progreso' && <Progreso estado={estado} recargar={() => cargarEstado()} />}
+        {tab === 'servicio' && <Servicio estado={estado} />}
+      </div>
+    </div>
+  );
+}
+
+const Campo = ({ label, children, ayuda }) => (
+  <label className="block"><span className="text-sm font-semibold text-gray-700">{label}</span>{children}
+    {ayuda && <span className="block text-xs text-gray-500 mt-1">{ayuda}</span>}</label>
+);
+const inp = 'mt-1 w-full border-2 border-gray-200 rounded-lg px-3 py-2 focus:border-purple-500 outline-none';
+
+function Generar({ clave, estado, alGuardar }) {
+  const F = LS.get('ps_form', {}); // el formulario se recuerda entre pestañas y visitas
+  const [estudio, setEstudio] = useState(F.estudio ?? estado?.estudio ?? '');
+  const [vinosTxt, setVinosTxt] = useState(F.vinosTxt ?? '');
+  const [porSesion, setPorSesion] = useState(F.porSesion ?? 8);
+  const [reps, setReps] = useState(F.reps ?? 3);
+  const [nPan, setNPan] = useState(F.nPan ?? 16);
+  const [parejo, setParejo] = useState(F.parejo ?? true);
+  const [semilla, setSemilla] = useState(() => F.semilla ?? (Math.floor(Math.random() * 99999) + 1));
+  const [atrTxt, setAtrTxt] = useState(F.atrTxt ?? (estado?.atributos || []).join('\n'));
+  useEffect(() => { LS.set('ps_form', { estudio, vinosTxt, porSesion, reps, nPan, parejo, semilla, atrTxt }); },
+    [estudio, vinosTxt, porSesion, reps, nPan, parejo, semilla, atrTxt]);
+  const [prev, setPrev] = useState(null);
+  const [msg, setMsg] = useState(null);
+  const [confirmar, setConfirmar] = useState(false);
+  const [ocupado, setOcupado] = useState(false);
+
+  useEffect(() => { if (estado && !atrTxt) setAtrTxt((estado.atributos || []).join('\n')); if (estado && !estudio) setEstudio(estado.estudio || ''); }, [estado]);
+
+  const lineas = t => t.split(/\r?\n|\t|;/).map(x => x.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const vinos = lineas(vinosTxt);
+  const dup = vinos.filter((v, i) => vinos.indexOf(v) !== i);
+
+  const generar = () => {
+    setMsg(null); setConfirmar(false);
+    if (vinos.length < 1) return setMsg({ t: 'error', m: 'Pegá al menos un vino.' });
+    if (dup.length) return setMsg({ t: 'error', m: 'Hay vinos repetidos: ' + [...new Set(dup)].join(', ') });
+    if (vinos.length * reps > 900) return setMsg({ t: 'error', m: 'Demasiadas muestras para códigos de 3 dígitos (máx. 900 vinos × repeticiones).' });
+    setPrev(generarDiseno({ vinos, porSesion: Number(porSesion), reps: Number(reps), nPanelistas: Number(nPan), parejo, semilla: Number(semilla) }));
+  };
+
+  const guardar = async (forzar = false) => {
+    setOcupado(true); setMsg(null);
+    try {
+      await api('adminGuardarDiseno', {
+        clave, forzar, estudio,
+        atributos: lineas(atrTxt),
+        sesiones: prev.sesiones.map(({ codigos, filasWilliams, ...s }) => s),
+        diseno: prev.diseno,
+      });
+      setConfirmar(false);
+      setMsg({ t: 'ok', m: '¡Diseño guardado! Los panelistas ya ven sus sesiones.' });
+      alGuardar();
+    } catch (e) {
+      if (e.data && e.data.hayRespuestas) setConfirmar(true);
+      else setMsg({ t: 'error', m: e.message });
+    } finally { setOcupado(false); }
+  };
+
+  const filasW = prev ? Math.max(...prev.sesiones.map(s => s.filasWilliams)) : 0;
+  const balanceado = prev ? prev.sesiones.every(s => Number(nPan) % s.filasWilliams === 0) : true;
+
+  return (
+    <div className="grid lg:grid-cols-5 gap-6">
+      <div className="lg:col-span-2 space-y-4">
+        <Campo label="Nombre del estudio">
+          <input className={inp} value={estudio} onChange={e => setEstudio(e.target.value)} placeholder="Ej: Malbec 2026" />
+        </Campo>
+        <Campo label={`Vinos (${vinos.length})`} ayuda="Uno por línea. Podés pegar una columna desde Excel.">
+          <textarea className={inp + ' h-40 font-mono text-sm'} value={vinosTxt} onChange={e => setVinosTxt(e.target.value)} placeholder={'T1R1\nT1R2\nT2R1\n…'} />
+        </Campo>
+        <div className="grid grid-cols-3 gap-3">
+          <Campo label="Vinos por sesión"><input type="number" min="1" className={inp} value={porSesion} onChange={e => setPorSesion(e.target.value)} /></Campo>
+          <Campo label="Repeticiones"><input type="number" min="1" className={inp} value={reps} onChange={e => setReps(e.target.value)} /></Campo>
+          <Campo label="Panelistas"><input type="number" min="1" className={inp} value={nPan} onChange={e => setNPan(e.target.value)} /></Campo>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-gray-700">
+          <input type="checkbox" checked={parejo} onChange={e => setParejo(e.target.checked)} className="w-4 h-4" />
+          Repartir los vinos parejo entre sesiones (ej. 17 vinos → 6+6+5 en vez de 8+8+1)
+        </label>
+        <Campo label="Semilla" ayuda="Con la misma semilla y los mismos datos se obtiene exactamente el mismo diseño.">
+          <input type="number" className={inp} value={semilla} onChange={e => setSemilla(e.target.value)} />
+        </Campo>
+        <Campo label={`Atributos (${lineas(atrTxt).length})`} ayuda="Uno por línea.">
+          <textarea className={inp + ' h-40 text-sm'} value={atrTxt} onChange={e => setAtrTxt(e.target.value)} />
+        </Campo>
+        <button onClick={generar} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-lg">Generar vista previa</button>
+        {msg && <p className={`p-3 rounded-lg ${msg.t === 'ok' ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>{msg.m}</p>}
+      </div>
+
+      <div className="lg:col-span-3">
+        {!prev
+          ? <div className="h-full min-h-[200px] border-2 border-dashed rounded-xl flex items-center justify-center text-gray-400 p-6 text-center">
+              Completá los datos y tocá “Generar vista previa”.<br/>Nada se publica hasta que lo guardes.
+            </div>
+          : <div>
+              <h2 className="text-lg font-bold text-gray-800 mb-1">Vista previa: {prev.sesiones.length} sesiones</h2>
+              <p className="text-sm text-gray-600 mb-3">
+                {prev.grupos.length} grupo(s) × {reps} repetición(es) · {nPan} panelistas · {prev.diseno.length} evaluaciones en total
+              </p>
+              {!balanceado && (
+                <p className="text-sm bg-amber-50 text-amber-800 p-3 rounded-lg mb-3">
+                  Para que el diseño de Williams quede completamente balanceado, el número de panelistas debería ser múltiplo de {
+                    [...new Set(prev.sesiones.map(s => s.filasWilliams))].join(' y ')}. Igual se puede usar.
+                </p>
+              )}
+              <div className="overflow-auto max-h-[420px] border rounded-lg">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-100 sticky top-0"><tr>
+                    <th className="p-2 text-left">Sesión</th><th className="p-2 text-left">Grupo</th><th className="p-2 text-left">Rep</th><th className="p-2 text-left">Vinos (código)</th>
+                  </tr></thead>
+                  <tbody>{prev.sesiones.map(s => (
+                    <tr key={s.Sesion} className="border-t align-top">
+                      <td className="p-2 font-bold">{s.Sesion}</td><td className="p-2">{s.Grupo}</td><td className="p-2">{s.Rep}</td>
+                      <td className="p-2">{s.Vinos.split(' | ').map(v => <span key={v} className="inline-block bg-gray-100 rounded px-2 py-0.5 mr-1 mb-1">{v} <b>({s.codigos[v]})</b></span>)}</td>
+                    </tr>))}
+                  </tbody>
+                </table>
+              </div>
+              {!confirmar
+                ? <button onClick={() => guardar(false)} disabled={ocupado}
+                    className="mt-4 w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-lg disabled:opacity-50">
+                    {ocupado ? 'Guardando…' : 'Guardar y publicar este diseño'}
+                  </button>
+                : <div className="mt-4 p-4 rounded-lg bg-red-50 border border-red-200">
+                    <p className="text-red-800 font-semibold mb-2">Ya hay respuestas del diseño anterior.</p>
+                    <p className="text-sm text-red-700 mb-3">Si continuás, esas respuestas no se borran: la hoja “Respuestas” se renombra como respaldo y empieza una nueva.</p>
+                    <div className="flex gap-2">
+                      <button onClick={() => guardar(true)} disabled={ocupado} className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-lg disabled:opacity-50">Sí, reemplazar diseño</button>
+                      <button onClick={() => setConfirmar(false)} className="flex-1 bg-gray-200 hover:bg-gray-300 font-semibold py-2 rounded-lg">Cancelar</button>
+                    </div>
+                  </div>}
+            </div>}
+      </div>
+    </div>
+  );
+}
+
+function Progreso({ estado, recargar }) {
+  if (!estado) return <p className="text-gray-500">Cargando…</p>;
+  const sesiones = estado.sesiones;
+  const pans = [...new Set(estado.diseno.map(d => d.Valuador))].sort(ordenNatural);
+  if (!sesiones.length) return <p className="text-gray-500">Todavía no hay un diseño guardado.</p>;
+  const total = pans.length * sesiones.length;
+  const completas = pans.reduce((acc, v) => acc + sesiones.filter(s => (estado.conteo[v + '|' + s.Sesion] || 0) >= s.NMuestras).length, 0);
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-gray-700"><b>{completas}</b> de <b>{total}</b> sesiones completadas</p>
+        <button onClick={recargar} className="text-sm bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded-lg">Actualizar</button>
+      </div>
+      <div className="overflow-auto max-h-[70vh] border rounded-lg">
+        <table className="text-sm">
+          <thead className="bg-gray-100 sticky top-0"><tr>
+            <th className="p-2 text-left sticky left-0 bg-gray-100">Panelista</th>
+            {sesiones.map(s => <th key={s.Sesion} className="p-2 text-center whitespace-nowrap">{s.Sesion}<div className="text-xs font-normal text-gray-500">{s.Grupo}·R{s.Rep}</div></th>)}
+          </tr></thead>
+          <tbody>{pans.map(v => (
+            <tr key={v} className="border-t">
+              <td className="p-2 font-bold sticky left-0 bg-white">{v}</td>
+              {sesiones.map(s => {
+                const c = estado.conteo[v + '|' + s.Sesion] || 0;
+                const cls = c >= s.NMuestras ? 'bg-emerald-500 text-white' : c > 0 ? 'bg-amber-300 text-amber-900' : 'bg-gray-100 text-gray-400';
+                return <td key={s.Sesion} className="p-1 text-center"><span className={`inline-block w-14 rounded py-1 font-semibold ${cls}`}>{c >= s.NMuestras ? '✔' : `${c}/${s.NMuestras}`}</span></td>;
+              })}
+            </tr>))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function Servicio({ estado }) {
+  const [s, setS] = useState('');
+  if (!estado) return <p className="text-gray-500">Cargando…</p>;
+  if (!estado.sesiones.length) return <p className="text-gray-500">Todavía no hay un diseño guardado.</p>;
+  const sel = s || estado.sesiones[0].Sesion;
+  const ses = estado.sesiones.find(x => x.Sesion === sel);
+  const filas = estado.diseno.filter(d => d.Sesion === sel);
+  const pans = [...new Set(filas.map(d => d.Valuador))].sort(ordenNatural);
+  const n = ses.NMuestras;
+  const clave = {}; filas.forEach(d => { clave[d.NombreProducto] = d.CodigoProducto; });
+  return (
+    <div>
+      <div className="flex flex-wrap gap-3 items-center mb-4 no-print">
+        <label className="font-semibold text-gray-700">Sesión</label>
+        <select value={sel} onChange={e => setS(e.target.value)} className="border-2 border-gray-200 rounded-lg px-3 py-2">
+          {estado.sesiones.map(x => <option key={x.Sesion} value={x.Sesion}>{x.Sesion} — {x.Grupo}, rep {x.Rep}</option>)}
+        </select>
+        <button onClick={() => window.print()} className="bg-gray-800 text-white px-4 py-2 rounded-lg font-semibold">Imprimir</button>
+      </div>
+      <h2 className="text-xl font-bold mb-1">{estado.estudio} — Sesión {sel} ({ses.Grupo}, repetición {ses.Rep})</h2>
+      <h3 className="font-semibold mt-4 mb-2">Orden de servicio (vino → código)</h3>
+      <table className="text-sm border mb-6">
+        <thead className="bg-gray-100"><tr><th className="p-2 border">Muestra</th><th className="p-2 border">Vino</th><th className="p-2 border">Código</th></tr></thead>
+        <tbody>{Object.keys(clave).sort((a, b) => filas.find(f => f.NombreProducto === a).Muestra - filas.find(f => f.NombreProducto === b).Muestra).map(v => (
+          <tr key={v}><td className="p-2 border text-center">{filas.find(f => f.NombreProducto === v).Muestra}</td><td className="p-2 border">{v}</td><td className="p-2 border text-center font-bold text-lg">{clave[v]}</td></tr>))}
+        </tbody>
+      </table>
+      <h3 className="font-semibold mb-2">Bandeja por panelista (orden de presentación)</h3>
+      <table className="text-sm border">
+        <thead className="bg-gray-100"><tr><th className="p-2 border">Panelista</th>{Array.from({ length: n }, (_, i) => <th key={i} className="p-2 border">{i + 1}º</th>)}</tr></thead>
+        <tbody>{pans.map(v => (
+          <tr key={v}><td className="p-2 border font-bold">{v}</td>
+            {filas.filter(d => d.Valuador === v).sort((a, b) => a.Orden - b.Orden).map(d =>
+              <td key={d.Orden} className="p-2 border text-center"><div className="font-bold text-base">{d.CodigoProducto}</div><div className="text-xs text-gray-500">{d.NombreProducto}</div></td>)}
+          </tr>))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// =====================================================================
+function Raiz() {
+  const [hash, setHash] = useState(location.hash);
+  useEffect(() => { const f = () => setHash(location.hash); window.addEventListener('hashchange', f); return () => window.removeEventListener('hashchange', f); }, []);
+  return hash === '#admin' ? <AdminApp/> : <PanelApp/>;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<Raiz/>);
+</script>
+</body>
+</html>
